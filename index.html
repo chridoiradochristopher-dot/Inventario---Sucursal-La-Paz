@@ -157,10 +157,10 @@
         </div>
     </div>
 </div>
-
 <script type="module">
     import { initializeApp } from "https://www.gstatic.com/firebasejs/9.22.0/firebase-app.js";
-    import { getFirestore, collection, addDoc, updateDoc, deleteDoc, doc, onSnapshot, query, orderBy, limit, getDocs, increment } 
+    // AGREGADO: Importamos 'getDoc' para poder leer antes de borrar
+    import { getFirestore, collection, addDoc, updateDoc, deleteDoc, doc, onSnapshot, query, orderBy, limit, getDocs, increment, getDoc } 
     from "https://www.gstatic.com/firebasejs/9.22.0/firebase-firestore.js";
 
     // --- CONFIGURACIÓN DE LA PAZ ---
@@ -214,7 +214,6 @@
     window.borrarHistorial = borrarHistorial;
     window.descargarHistorialCompleto = descargarHistorialCompleto;
     window.descargarInventarioStock = descargarInventarioStock;
-    // --- NUEVA FUNCIÓN EXPORTADA ---
     window.editarHistorial = editarHistorial; 
 
     // --- CARGAR PRODUCTOS ---
@@ -224,6 +223,8 @@
         const selectModel = document.getElementById('manual-model'); 
         
         grid.innerHTML = "";
+        // Guardamos el valor actual para no perder la selección al refrescar
+        const currentVal = selectModel.value;
         selectModel.innerHTML = '<option value="">-- Seleccionar Marco --</option>';
 
         snapshot.docs.forEach(d => {
@@ -251,8 +252,10 @@
             option.text = data.name; 
             selectModel.appendChild(option);
         });
+        if(currentVal) selectModel.value = currentVal;
     });
 
+    // --- HISTORIAL CON INDICADOR DE DESCUENTO ---
     const qHist = query(collection(db, "historial"), orderBy("fecha", "desc"), limit(30));
     onSnapshot(qHist, (snapshot) => {
         const list = document.getElementById('history-list'); list.innerHTML = "";
@@ -268,16 +271,23 @@
             const etiqueta = esMision ? '<span class="tag-mision">MISIÓN</span>' : '';
             const fallecidoInfo = (esMision && data.nombre_fallecido) ? `<br><small style="color:#e65100">Fallecido: ${data.nombre_fallecido}</small>` : '';
 
-            // --- LÓGICA DE RENDERIZADO MODIFICADA PARA INCLUIR EDICIÓN ---
+            // Lógica visual: Mostrar si este registro descontó stock
+            let infoDescuento = "";
+            if (data.id_producto_descontado) {
+                infoDescuento = `<span style="font-size:0.8em; color:green; margin-left:5px;" title="Este registro restó stock del inventario">📉 Stock descontado</span>`;
+            } else {
+                infoDescuento = `<span style="font-size:0.8em; color:#999; margin-left:5px;" title="Este registro NO afectó el stock">⚪ Sin descuento</span>`;
+            }
+
             const medidaActual = data.medida_detectada || '';
             const li = document.createElement('li'); li.className = claseCss;
             li.innerHTML = `
                 <div class="h-row">
                     <span class="h-model">${data.nombre_marco || 'Trabajo'} ${etiqueta}</span>
-                    <button class="btn-del-hist" onclick="borrarHistorial('${id}')">✕</button>
+                    <button class="btn-del-hist" onclick="borrarHistorial('${id}')" title="Borrar y restaurar stock">✕</button>
                 </div>
                 <div class="h-meta">
-                    <span class="h-time">${fechaStr}</span>
+                    <span class="h-time">${fechaStr} ${infoDescuento}</span>
                     <span style="display:flex; align-items:center; gap: 5px;">
                         Medida: <strong>${medidaActual || '-'}</strong>
                         <button class="btn-edit-mini" title="Corregir medida" onclick="editarHistorial('${id}', '${medidaActual}')">✎</button>
@@ -288,22 +298,16 @@
         });
     });
 
-    // --- NUEVA FUNCIÓN PARA EDITAR LA MEDIDA ---
     async function editarHistorial(id, valorActual) {
         const nuevoValor = prompt("Corregir medida (Ej: 30*42):", valorActual);
         if (nuevoValor !== null && nuevoValor !== valorActual) {
             try {
-                // Solo actualizamos el campo medida_detectada
-                await updateDoc(doc(db, "historial", id), { 
-                    medida_detectada: nuevoValor 
-                });
-            } catch (e) {
-                console.error(e);
-                alert("Error al actualizar: " + e.message);
-            }
+                await updateDoc(doc(db, "historial", id), { medida_detectada: nuevoValor });
+            } catch (e) { console.error(e); alert("Error al actualizar: " + e.message); }
         }
     }
 
+    // --- REGISTRO MANUAL MODIFICADO (Guarda el ID) ---
     async function registrarManual() {
         const selectModel = document.getElementById('manual-model');
         const modelId = selectModel.value; 
@@ -320,18 +324,24 @@
         const nombreCompuesto = detalle ? `${modelName} - ${detalle}` : modelName;
 
         try {
+            // 1. Guardamos el historial INCLUYENDO el ID del producto que vamos a descontar
             await addDoc(collection(db, "historial"), {
                 nombre_marco: nombreCompuesto, 
                 medida_detectada: medida, 
                 es_mision: checkMision, 
                 nombre_fallecido: checkMision ? fallecido : "", 
                 fecha: new Date(), 
-                archivo_original: "Registro Manual"
+                archivo_original: "Registro Manual",
+                // NUEVOS CAMPOS CLAVE:
+                id_producto_descontado: modelId, 
+                nombre_producto_descontado: modelName
             });
 
+            // 2. Descontamos el stock
             const productRef = doc(db, "productos", modelId);
             await updateDoc(productRef, { quantity: increment(-1) });
 
+            // Limpieza del formulario
             selectModel.value = "";
             document.getElementById('manual-name').value = ""; 
             document.getElementById('manual-size').value = "";
@@ -342,6 +352,45 @@
         } catch (e) {
             console.error(e);
             alert("Error al registrar: " + e.message);
+        }
+    }
+
+    // --- BORRADO INTELIGENTE (Restaura Stock) ---
+    async function borrarHistorial(idHistorial) {
+        if(!confirm("¿Borrar este registro? Si tuvo descuento, el stock se devolverá.")) return;
+
+        try {
+            // 1. Obtener el documento del historial antes de borrarlo
+            const historialRef = doc(db, "historial", idHistorial);
+            const docSnap = await getDoc(historialRef);
+
+            if (docSnap.exists()) {
+                const data = docSnap.data();
+
+                // 2. Verificar si este registro descontó un producto
+                if (data.id_producto_descontado) {
+                    const idProd = data.id_producto_descontado;
+                    
+                    // 3. Devolver el stock (+1)
+                    try {
+                        const prodRef = doc(db, "productos", idProd);
+                        await updateDoc(prodRef, { quantity: increment(1) });
+                        console.log(`Stock restaurado para el producto ID: ${idProd}`);
+                    } catch (errorStock) {
+                        console.warn("No se pudo restaurar el stock (tal vez el producto ya no existe):", errorStock);
+                        alert("Advertencia: Se borrará el historial, pero no se pudo restaurar el stock (el producto quizás fue eliminado).");
+                    }
+                }
+                
+                // 4. Finalmente borrar el registro del historial
+                await deleteDoc(historialRef);
+            } else {
+                alert("El registro ya no existe.");
+            }
+
+        } catch (e) {
+            console.error(e);
+            alert("Error al borrar: " + e.message);
         }
     }
 
@@ -458,8 +507,8 @@
     async function cambiarCant(id, c, ch) { await updateDoc(doc(db, "productos", id), { quantity: c + ch }); }
     async function fijarCant(id) { if(confirm("¿Editar Stock?")) { const v = prompt("Total:"); if(v) await updateDoc(doc(db, "productos", id), { quantity: parseInt(v) }); } }
     async function borrarItem(id) { if(confirm("¿Borrar permanentemente?")) await deleteDoc(doc(db, "productos", id)); }
-    async function borrarHistorial(id) { if(confirm("¿Borrar del historial?")) await deleteDoc(doc(db, "historial", id)); }
     function resizeImage(file) { return new Promise(r => { const reader = new FileReader(); reader.onload = e => { const img = new Image(); img.onload = () => { const c = document.createElement('canvas'); c.width = 200; c.height = (200/img.width)*img.height; c.getContext('2d').drawImage(img,0,0,c.width,c.height); r(c.toDataURL('image/jpeg', 0.6)); }; img.src = e.target.result; }; reader.readAsDataURL(file); }); }
 </script>
+
 </body>
 </html>
